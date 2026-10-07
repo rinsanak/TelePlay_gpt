@@ -12,7 +12,10 @@ from slowapi.util import get_remote_address
 
 from ..database import get_db
 from ..models import File, User
-from ..auth import get_current_user
+from ..auth import get_current_user, verify_token_payload
+from ..config import get_settings
+from datetime import datetime, timedelta
+from jose import jwt
 from .. import telegram
 from ..telegram import get_message_from_channel
 from ..streaming import stream_file as stream_file_generator
@@ -39,6 +42,40 @@ def parse_range_header(range_header: str, file_size: int) -> tuple[int, int]:
     end = int(match.group(2)) if match.group(2) else file_size - 1
     
     return start, min(end, file_size - 1)
+
+
+@router.post("/{file_id}/external")
+async def external_player_link(
+    file_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file = (await db.execute(select(File).where(
+        File.id == file_id, File.user_id == current_user.id
+    ))).scalar_one_or_none()
+    if file is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    token = jwt.encode({
+        "type": "external_stream", "file_id": file.id,
+        "sub": str(current_user.id), "ver": current_user.auth_version,
+        "exp": datetime.utcnow() + timedelta(hours=12),
+    }, get_settings().jwt_secret, algorithm="HS256")
+    return {"path": f"/api/stream/external/{token}"}
+
+
+@router.get("/external/{token}")
+async def external_stream(
+    token: str, request: Request, db: AsyncSession = Depends(get_db),
+):
+    payload = verify_token_payload(token, "external_stream")
+    if not payload:
+        raise HTTPException(status_code=401, detail="Playback link expired")
+    user = (await db.execute(select(User).where(
+        User.id == int(payload["sub"])
+    ))).scalar_one_or_none()
+    if user is None or user.auth_version != payload.get("ver"):
+        raise HTTPException(status_code=401, detail="Playback link revoked")
+    return await stream_file(payload["file_id"], request, db, user, download=0)
 
 
 @router.get("/{file_id}")

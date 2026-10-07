@@ -13,6 +13,22 @@ class FilesRepository @Inject constructor(
     private val api: TelePlayApi
 ) {
 
+    suspend fun getSubtitles(fileId: Int): Result<List<FileItem>> = try {
+        val response = api.getSubtitles(fileId)
+        if (response.isSuccessful) Result.success(response.body().orEmpty())
+        else Result.failure(Exception("Could not load subtitles (${response.code()}). Update the server and retry."))
+    } catch (e: kotlinx.coroutines.CancellationException) { throw e
+    } catch (e: Exception) { Result.failure(e) }
+
+    suspend fun getExternalPlayerLink(fileId: Int, serverUrl: String): Result<String> = try {
+        val response = api.getExternalPlayerLink(fileId)
+        val path = response.body()?.get("path")
+        if (response.isSuccessful && path != null && path.startsWith("/api/stream/external/"))
+            Result.success(serverUrl.trimEnd('/') + path)
+        else Result.failure(Exception("Could not create playback link. Update the server and retry."))
+    } catch (e: kotlinx.coroutines.CancellationException) { throw e
+    } catch (e: Exception) { Result.failure(e) }
+
     /**
      * Get paginated list of files.
      */

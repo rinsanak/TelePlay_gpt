@@ -156,6 +156,8 @@ fun MobilePlayerScreen(
         onBack()
     }
 
+    com.telegramtv.ui.player.PlayerExtras(viewModel, uiState)
+
     // Settings Bottom Sheet
     if (uiState.showSettings) {
         ModalBottomSheet(
@@ -169,6 +171,9 @@ fun MobilePlayerScreen(
                 onAudioTrackSelect = viewModel::selectAudioTrack,
                 onSubtitleTrackSelect = viewModel::selectSubtitleTrack,
                 onSubtitleSizeChange = viewModel::setSubtitleSize,
+                onAddSubtitle = viewModel::showAddSubtitle,
+                onBoostChange = viewModel::setSoundBoost,
+                onExternalPlayer = { viewModel.openInExternalPlayer(context) },
                 onResizeModeChange = viewModel::setResizeMode,
                 onVideoScaleChange = viewModel::setVideoScale,
                 onOrientationChange = viewModel::setOrientationLock
@@ -604,6 +609,9 @@ fun PlayerSettingsSheet(
     onAudioTrackSelect: (TrackInfo) -> Unit,
     onSubtitleTrackSelect: (TrackInfo?) -> Unit,
     onSubtitleSizeChange: (SubtitleSize) -> Unit,
+    onAddSubtitle: () -> Unit,
+    onBoostChange: (Int) -> Unit,
+    onExternalPlayer: () -> Unit,
     onResizeModeChange: (Int) -> Unit,
     onVideoScaleChange: (Float) -> Unit,
     onOrientationChange: (Int) -> Unit
@@ -646,6 +654,7 @@ fun PlayerSettingsSheet(
 
         Spacer(modifier = Modifier.height(16.dp))
 
+        TextButton(onClick = onExternalPlayer) { Text("Select external player") }
         when (selectedTab) {
             0 -> { // Speed
                 val speeds = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
@@ -661,21 +670,17 @@ fun PlayerSettingsSheet(
                 }
             }
             1 -> { // Audio
-                if (uiState.audioTracks.isEmpty()) {
-                    Box(modifier = Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) {
-                        Text("No audio tracks available", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                LazyColumn(modifier = Modifier.height(250.dp)) {
+                    items(uiState.audioTracks) { track ->
+                        SettingsItem(text = track.name, isSelected = track.isSelected,
+                            onClick = { onAudioTrackSelect(track) })
                     }
-                } else {
-                     LazyColumn(modifier = Modifier.height(250.dp)) {
-                        items(uiState.audioTracks) { track ->
-                            SettingsItem(
-                                text = track.name,
-                                isSelected = track.isSelected,
-                                onClick = { onAudioTrackSelect(track) },
-                                icon = Icons.Filled.PlayArrow
-                            )
-                        }
+                    item { Text("Sound boost • 100% = original", Modifier.padding(horizontal = 24.dp)) }
+                    items(listOf(100, 125, 150, 175, 200)) { percent ->
+                        SettingsItem(text = "$percent%", isSelected = uiState.soundBoostPercent == percent,
+                            onClick = { onBoostChange(percent) })
                     }
+                    item { Text("No re-encoding. Boost may compress loud peaks.", Modifier.padding(24.dp)) }
                 }
             }
             2 -> { // Subtitles
@@ -696,7 +701,10 @@ fun PlayerSettingsSheet(
                              icon = Icons.Filled.Info
                         )
                     }
-                    
+                    item {
+                        SettingsItem(text = "Add subtitle", subText = "Telegram or device storage",
+                            isSelected = false, onClick = onAddSubtitle)
+                    }
                     item {
                         HorizontalDivider(
                             modifier = Modifier.padding(vertical = 12.dp),

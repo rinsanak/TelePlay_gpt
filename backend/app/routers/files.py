@@ -5,7 +5,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 import secrets
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func, delete, or_
+from ..subtitle_matching import rank_subtitles
 from sqlalchemy.orm import selectinload
 
 from ..database import get_db
@@ -119,6 +120,30 @@ async def get_storage_stats(
         "total_size": total_size,
         "limit": -1  # Unlimited
     }
+
+
+@router.get("/{file_id}/subtitles", response_model=list[FileResponse])
+async def get_subtitles(
+    file_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Latest four subtitles from this user's private bot chat, best match first."""
+    video = (await db.execute(select(File).where(
+        File.id == file_id, File.user_id == current_user.id
+    ))).scalar_one_or_none()
+    if video is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    query = select(File).where(
+        File.user_id == current_user.id,
+        or_(*(func.lower(File.file_name).endswith(ext)
+              for ext in (".srt", ".vtt", ".ass", ".ssa"))),
+    ).options(selectinload(File.watch_progress)).order_by(
+        File.created_at.desc(), File.id.desc()
+    ).limit(4)
+    recent = (await db.execute(query)).scalars().all()
+    return [FileResponse(**add_urls_to_file(f))
+            for f in rank_subtitles(video.file_name, recent)]
 
 
 @router.get("/{file_id}", response_model=FileResponse)

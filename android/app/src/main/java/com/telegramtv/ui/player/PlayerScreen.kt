@@ -63,6 +63,8 @@ fun PlayerScreen(
     val context = LocalContext.current
     val focusRequester = remember { FocusRequester() }
 
+    PlayerExtras(viewModel, uiState)
+
     // Handle back and save progress when leaving
     DisposableEffect(Unit) {
         onDispose {
@@ -321,6 +323,10 @@ fun PlayerScreen(
                 subtitleSize = uiState.subtitleSize,
                 subtitlesEnabled = uiState.subtitlesEnabled,
                 playbackSpeed = uiState.playbackSpeed,
+                soundBoostPercent = uiState.soundBoostPercent,
+                onBoostChange = viewModel::setSoundBoost,
+                onAddSubtitle = viewModel::showAddSubtitle,
+                onExternalPlayer = { viewModel.openInExternalPlayer(context) },
                 onSelectAudio = { viewModel.selectAudioTrack(it) },
                 onSelectSubtitle = { viewModel.selectSubtitleTrack(it) },
                 onSubtitleSizeChange = { viewModel.setSubtitleSize(it) },
@@ -720,7 +726,7 @@ private fun PlayerControls(
                 size = 44.dp
             )
 
-            if (hasAudioTracks || hasSubtitles) {
+            run {
                 Spacer(modifier = Modifier.width(8.dp))
                 ControlIconButton(
                     icon = Icons.Default.Settings,
@@ -1263,6 +1269,10 @@ private fun SettingsPanel(
     subtitleSize: SubtitleSize,
     subtitlesEnabled: Boolean,
     playbackSpeed: Float,
+    soundBoostPercent: Int,
+    onBoostChange: (Int) -> Unit,
+    onAddSubtitle: () -> Unit,
+    onExternalPlayer: () -> Unit,
     onSelectAudio: (TrackInfo) -> Unit,
     onSelectSubtitle: (TrackInfo?) -> Unit,
     onSubtitleSizeChange: (SubtitleSize) -> Unit,
@@ -1359,8 +1369,18 @@ private fun SettingsPanel(
                         Spacer(modifier = Modifier.height(12.dp))
                     }
 
-                    // Subtitle section
-                    if (subtitleTracks.isNotEmpty()) {
+                    SettingsSectionLabel(title = "Sound boost", icon = Icons.AutoMirrored.Filled.VolumeUp)
+                    listOf(100, 125, 150, 175, 200).forEach { percent ->
+                        FocusableTrackItem(name = "$percent%", subtitle = if (percent == 100) "Original audio" else null,
+                            isSelected = soundBoostPercent == percent, onClick = { onBoostChange(percent) })
+                    }
+                    Text("No re-encoding. Boost may compress loud peaks; 100% disables processing.",
+                        color = TVTextSecondary, style = MaterialTheme.typography.bodySmall)
+                    FocusableTrackItem(name = "Select external player", subtitle = "Choose an installed player",
+                        isSelected = false, onClick = onExternalPlayer)
+
+                    // Always available, including videos without embedded subtitle tracks.
+                    run {
                         SettingsSectionLabel(title = "Subtitles", icon = Icons.Default.Subtitles)
                         FocusableTrackItem(
                             name = "Off",
@@ -1376,6 +1396,8 @@ private fun SettingsPanel(
                                 onClick = { onSelectSubtitle(track) }
                             )
                         }
+                        FocusableTrackItem(name = "Add subtitle", subtitle = "Telegram or device storage",
+                            isSelected = false, onClick = onAddSubtitle)
                         Spacer(modifier = Modifier.height(12.dp))
 
                         // Subtitle size

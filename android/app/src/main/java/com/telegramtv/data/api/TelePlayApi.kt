@@ -50,6 +50,12 @@ interface TelePlayApi {
     suspend fun getBotInfo(): Response<BotInfo>
 
 
+    @GET("files/{id}/subtitles")
+    suspend fun getSubtitles(@Path("id") fileId: Int): Response<List<FileItem>>
+
+    @POST("stream/{id}/external")
+    suspend fun getExternalPlayerLink(@Path("id") fileId: Int): Response<Map<String, String>>
+
     // ============ Files ============
 
     /**
