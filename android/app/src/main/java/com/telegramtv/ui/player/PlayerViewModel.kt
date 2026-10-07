@@ -3,6 +3,13 @@ package com.telegramtv.ui.player
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.media.audiofx.LoudnessEnhancer
+import android.provider.OpenableColumns
+import androidx.media3.common.MimeTypes
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlin.math.log10
+import kotlin.math.roundToInt
 import android.os.Build
 import android.os.Environment
 import androidx.annotation.OptIn
@@ -81,6 +88,12 @@ enum class ErrorType {
  * Player UI state.
  */
 data class PlayerUiState(
+    val showAddSubtitle: Boolean = false,
+    val loadingSubtitles: Boolean = false,
+    val externalSubtitles: List<FileItem> = emptyList(),
+    val subtitleError: String? = null,
+    val playerNotice: String? = null,
+    val soundBoostPercent: Int = 100,
     val isLoading: Boolean = true,
     val isPlaying: Boolean = false,
     val isBuffering: Boolean = false,
@@ -211,6 +224,12 @@ class PlayerViewModel @Inject constructor(
     private var consecutiveSeekCount: Int = 0
     private var lastSeekTime: Long = 0L
 
+    private var loudnessEnhancer: LoudnessEnhancer? = null
+    private var subtitleJob: kotlinx.coroutines.Job? = null
+    private var selectedSubtitle: MediaItem.SubtitleConfiguration? = null
+    private var pendingSubtitleLabel: String? = null
+    private var playerListener: Player.Listener? = null
+
     init {
         setupPlayerListener()
         loadAndPlay()
@@ -222,7 +241,12 @@ class PlayerViewModel @Inject constructor(
      */
     @OptIn(UnstableApi::class)
     private fun setupPlayerListener() {
-        exoPlayer.addListener(object : Player.Listener {
+        val listener = object : Player.Listener {
+            override fun onAudioSessionIdChanged(audioSessionId: Int) {
+                releaseBoost()
+                if (_uiState.value.soundBoostPercent > 100) applyBoost()
+            }
+
             override fun onPlaybackStateChanged(state: Int) {
                 when (state) {
                     Player.STATE_BUFFERING -> {
@@ -269,7 +293,9 @@ class PlayerViewModel @Inject constructor(
                     error = parsedError
                 )
             }
-        })
+        }
+        playerListener = listener
+        exoPlayer.addListener(listener)
     }
 
     /**
@@ -410,6 +436,12 @@ class PlayerViewModel @Inject constructor(
             }
         }
 
+        pendingSubtitleLabel?.let { label ->
+            subtitleTracks.firstOrNull { it.name == label }?.let { track ->
+                pendingSubtitleLabel = null
+                selectSubtitleTrack(track)
+            }
+        }
         _uiState.value = _uiState.value.copy(
             audioTracks = audioTracks,
             subtitleTracks = subtitleTracks
@@ -544,7 +576,6 @@ class PlayerViewModel @Inject constructor(
                     val useLocalFile = localFile.exists() && localFile.length() > 0
 
                     val mediaItem: MediaItem
-                    val mediaSourceFactory: DefaultMediaSourceFactory
 
                     if (useLocalFile) {
                         // ── Play from local file ──
@@ -553,10 +584,6 @@ class PlayerViewModel @Inject constructor(
                             .setUri(localUri)
                             .setMediaId(fileId.toString())
                             .build()
-                        // DefaultDataSource.Factory handles both file:// and http:// URIs
-                        mediaSourceFactory = DefaultMediaSourceFactory(
-                            DefaultDataSource.Factory(context, httpDataSourceFactory)
-                        )
                     } else {
                         // ── Stream from server ──
                         val serverUrl = settingsRepository.getServerUrl()
@@ -577,11 +604,16 @@ class PlayerViewModel @Inject constructor(
                             .setMediaId(fileId.toString())
                             .build()
                         httpDataSourceFactory.setAllowCrossProtocolRedirects(true)
-                        mediaSourceFactory = DefaultMediaSourceFactory(httpDataSourceFactory)
                     }
 
-                    // Load and prepare
-                    exoPlayer.setMediaSource(mediaSourceFactory.createMediaSource(mediaItem))
+                    // DefaultDataSource also supports subtitles selected through the device picker.
+                    val playableItem = selectedSubtitle?.let {
+                        pendingSubtitleLabel = it.label
+                        mediaItem.buildUpon().setSubtitleConfigurations(listOf(it)).build()
+                    } ?: mediaItem
+                    val sourceFactory = DefaultMediaSourceFactory(
+                        DefaultDataSource.Factory(context, httpDataSourceFactory))
+                    exoPlayer.setMediaSource(sourceFactory.createMediaSource(playableItem))
                     exoPlayer.prepare()
 
                     // Seek to resume position if provided
@@ -645,25 +677,131 @@ class PlayerViewModel @Inject constructor(
     fun openInExternalPlayer(context: Context) {
         viewModelScope.launch {
             val file = _uiState.value.file ?: return@launch
-            val serverUrl = settingsRepository.getServerUrl()
-            
-            // Get public link instead of tokenized one
-            val publicLinkResult = filesRepository.getPublicLink(file.id, serverUrl)
-            
-            val streamUrl = publicLinkResult.getOrElse {
-                // Fallback to tokenized if public link fails
-                "$serverUrl/api/stream/${file.id}"
-            }
-            
+            filesRepository.getExternalPlayerLink(file.id, settingsRepository.getServerUrl()).fold(
+                onSuccess = { url ->
+                    try {
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(Uri.parse(url), if (file.isAudio) "audio/*" else "video/*")
+                            putExtra("title", file.fileName)
+                            putExtra("position", exoPlayer.currentPosition.toInt())
+                        }
+                        val chooser = Intent.createChooser(intent, "Select external player")
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        context.startActivity(chooser)
+                        pause()
+                        saveProgress()
+                    } catch (e: Exception) {
+                        showNotice("No compatible external player found. Install VLC or another player.")
+                    }
+                },
+                onFailure = { showNotice(it.message ?: "Could not open external player") }
+            )
+        }
+    }
+
+    fun showNotice(message: String) {
+        _uiState.value = _uiState.value.copy(playerNotice = message)
+    }
+
+    fun dismissNotice() { _uiState.value = _uiState.value.copy(playerNotice = null) }
+
+    fun showAddSubtitle() {
+        _uiState.value = _uiState.value.copy(showAddSubtitle = true, loadingSubtitles = true,
+            subtitleError = null, showSettings = false, externalSubtitles = emptyList())
+        controlHideJob?.cancel()
+        subtitleJob?.cancel()
+        subtitleJob = viewModelScope.launch {
+            filesRepository.getSubtitles(fileId).fold(
+                onSuccess = { _uiState.value = _uiState.value.copy(
+                    loadingSubtitles = false, externalSubtitles = it) },
+                onFailure = { _uiState.value = _uiState.value.copy(
+                    loadingSubtitles = false, subtitleError = it.message ?: "Could not load subtitles") }
+            )
+        }
+    }
+
+    fun dismissAddSubtitle() {
+        subtitleJob?.cancel()
+        _uiState.value = _uiState.value.copy(showAddSubtitle = false, loadingSubtitles = false)
+        scheduleControlsHide()
+    }
+
+    fun addTelegramSubtitle(file: FileItem) {
+        viewModelScope.launch {
+            val token = authRepository.getAccessToken()
+            httpDataSourceFactory.setDefaultRequestProperties(
+                token?.let { mapOf("Authorization" to "Bearer $it") } ?: emptyMap())
+            attachSubtitle(Uri.parse(filesRepository.getStreamUrl(file.id,
+                settingsRepository.getServerUrl().trimEnd('/'))), file.fileName)
+        }
+    }
+
+    fun addLocalSubtitle(uri: Uri) {
+        viewModelScope.launch {
             try {
-                val intent = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(Uri.parse(streamUrl), "video/*")
-                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                val name = withContext(Dispatchers.IO) {
+                    context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME),
+                        null, null, null)?.use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getString(0) else null
+                    } ?: uri.lastPathSegment.orEmpty()
                 }
-                context.startActivity(intent)
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+                attachSubtitle(uri, name)
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e
+            } catch (e: Exception) { showNotice("Could not read subtitle file. Please select it again.") }
+        }
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun attachSubtitle(uri: Uri, name: String) {
+        val mime = when (name.substringAfterLast('.', "").lowercase(java.util.Locale.ROOT)) {
+            "srt" -> MimeTypes.APPLICATION_SUBRIP
+            "vtt" -> MimeTypes.TEXT_VTT
+            "ass", "ssa" -> MimeTypes.TEXT_SSA
+            else -> { showNotice("Select an .srt, .vtt, .ass or .ssa file"); return }
+        }
+        val current = exoPlayer.currentMediaItem ?: return
+        val subtitle = MediaItem.SubtitleConfiguration.Builder(uri)
+            .setMimeType(mime).setLabel(name).setId("external-subtitle")
+            .setSelectionFlags(C.SELECTION_FLAG_DEFAULT).build()
+        selectedSubtitle = subtitle
+        pendingSubtitleLabel = name
+        val position = exoPlayer.currentPosition.coerceAtLeast(0)
+        val playWhenReady = exoPlayer.playWhenReady
+        exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon()
+            .clearOverridesOfType(C.TRACK_TYPE_TEXT).setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false).build()
+        val item = current.buildUpon().setSubtitleConfigurations(listOf(subtitle)).build()
+        val factory = DefaultMediaSourceFactory(DefaultDataSource.Factory(context, httpDataSourceFactory))
+        exoPlayer.setMediaSource(factory.createMediaSource(item), position)
+        exoPlayer.prepare()
+        exoPlayer.playWhenReady = playWhenReady
+        _uiState.value = _uiState.value.copy(subtitlesEnabled = true)
+        dismissAddSubtitle()
+    }
+
+    fun setSoundBoost(percent: Int) {
+        _uiState.value = _uiState.value.copy(soundBoostPercent = percent.coerceIn(100, 200))
+        applyBoost()
+    }
+
+    private fun releaseBoost() {
+        runCatching { loudnessEnhancer?.release() }
+        loudnessEnhancer = null
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun applyBoost() {
+        val percent = _uiState.value.soundBoostPercent
+        if (percent == 100) { releaseBoost(); return }
+        val sessionId = exoPlayer.audioSessionId
+        if (sessionId == C.AUDIO_SESSION_ID_UNSET || sessionId == 0) return
+        try {
+            val effect = loudnessEnhancer ?: LoudnessEnhancer(sessionId).also { loudnessEnhancer = it }
+            effect.setTargetGain((2000 * log10(percent / 100.0)).roundToInt())
+            effect.enabled = true
+        } catch (e: Exception) {
+            releaseBoost()
+            _uiState.value = _uiState.value.copy(soundBoostPercent = 100)
+            showNotice("Sound boost is unavailable on this device or audio output.")
         }
     }
 
@@ -844,7 +982,7 @@ class PlayerViewModel @Inject constructor(
      */
     fun showControls() {
         _uiState.value = _uiState.value.copy(showControls = true)
-        if (!_uiState.value.showSettings) {
+        if (!_uiState.value.showSettings && !_uiState.value.showAddSubtitle) {
             scheduleControlsHide()
         }
     }
@@ -853,7 +991,7 @@ class PlayerViewModel @Inject constructor(
      * Hide controls.
      */
     fun hideControls() {
-        if (_uiState.value.isPlaying && !_uiState.value.showSettings) {
+        if (_uiState.value.isPlaying && !_uiState.value.showSettings && !_uiState.value.showAddSubtitle) {
             _uiState.value = _uiState.value.copy(showControls = false)
         }
     }
@@ -865,7 +1003,7 @@ class PlayerViewModel @Inject constructor(
         controlHideJob?.cancel()
         controlHideJob = viewModelScope.launch {
             delay(5000)
-            if (_uiState.value.isPlaying && !_uiState.value.showSettings) {
+            if (_uiState.value.isPlaying && !_uiState.value.showSettings && !_uiState.value.showAddSubtitle) {
                 _uiState.value = _uiState.value.copy(showControls = false)
             }
         }
@@ -966,6 +1104,8 @@ class PlayerViewModel @Inject constructor(
 
     override fun onCleared() {
         super.onCleared()
+        playerListener?.let { exoPlayer.removeListener(it) }
+        releaseBoost()
         saveProgress()
         if (!isBackgroundAudioActive) {
             // Only stop player if NOT handing off to background service
